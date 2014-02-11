@@ -1,6 +1,8 @@
 <?php
 // Requires App::build() to include Google's Client API directories
 
+// declare unique app namespace APP_NAME
+
 /** @filesource Server path to vendor directory - used to import client library **/
 $PHP_VENDOR_BASE = str_replace('/CakePHP/Component', '', __DIR__) . DS;
 require_once $PHP_VENDOR_BASE . 'google' . DS . 'google-api-php-client' . DS . 'src' . DS . "Google_Client.php";
@@ -23,6 +25,8 @@ class GoogleDriveComponent extends Component {
     private $ready = false;
     const PERMISSION_PUBLIC = "public";
     const PERMISSION_PRIVATE = "private";
+    
+    //public $components = array('Directory');
     
     public function initialize(\Controller $controller) {
         parent::initialize($controller);
@@ -79,8 +83,11 @@ class GoogleDriveComponent extends Component {
         $this->google->setAccessToken($token);
         $this->userinfo = $this->verify_credentials($controller, $token);
         if(!empty($this->userinfo)):
+            $this->setUser($this->user['id'], $token);
+            /*
             $this->setTokens($token);
             $this->setUserId($this->user['id']);
+             */
             $this->ready = true;
             // send to application
             $controller->redirect($this->config['redirect_url']);
@@ -96,37 +103,35 @@ class GoogleDriveComponent extends Component {
         $this->google->setAccessToken($credentials);
         // attempt to refresh 
         $tokens = json_decode($credentials, true);
+        $now = time();
+        $expired = 0;
         // get a new access token
         if(!empty($tokens['refresh_token'])):
-            // get new access token
-            $this->google->refreshToken($tokens['refresh_token']);
+            $now = time();
+            $expired =$tokens['created']+$tokens['expires_in'];
+            if($now<$expired):
+                $this->google->refreshToken($tokens['refresh_token']);
+            endif;
         endif;
         
-        try {
-          return $this->oauth->userinfo->get();
-        } catch (Google_ServiceException $e) {
-            if ($e->getCode() == 401) {
-                  // This user may have disabled the Glassware on MyGlass.
-                  // Clean up the mess and attempt to re-auth.
-                  $this->cleanUser();
-                  if($api_mode):
-                      return array('success'=>false, 'message'=>$e->getMessage());
-                  else:
-                       $controller->redirect($this->getAuthUrl());
-                  endif;
-                  // $controller->redirect($this->config['redirect_url']);
-                  // echo $this->getAuthUrl();
-                  // exit;
-            } else {
-                  // Let it go...
-                  // throw $e;
-                  if($api_mode):
-                      return array('success'=>false, 'message'=>$e->getMessage());
-                  else:
-                      throw $e;
-                  endif;
-            }
-        }
+        if($now>$expired):
+            if($api_mode):
+                return array('success'=>false, 'message'=>'Authentication failed');
+            else:
+                $controller->redirect($this->getAuthUrl());
+            endif;
+        endif;
+        
+        $user = $this->oauth->userinfo->get();
+        if(empty($user)):
+            if($api_mode):
+                return array('success'=>false, 'message'=>'Authentication failed');
+            else:
+                $controller->redirect($this->getAuthUrl());
+            endif;
+        else:
+            return $user;
+        endif;
     }
     
     public function isReady() {
@@ -151,36 +156,95 @@ class GoogleDriveComponent extends Component {
         }
     }
     
+    private function setUser($id, $token) {
+        $_SESSION[APP_NAME . 'gd_user'] = array(
+            'id'=>$id,
+            'gd_tokens'=>json_decode($token, true)
+        );
+    }
+    /*
     private function setUserId($id) {
         $_SESSION['gd_user']['id'] = $id;
     }
-    
+    */
     function getUser() {
-        if (isset($_SESSION["gd_user"])) {
-          return $_SESSION["gd_user"];
+        if (isset($_SESSION[APP_NAME . "gd_user"])) {
+          return $_SESSION[APP_NAME . "gd_user"];
         }
     }
     
     private function getUserId() {
-        if(empty($_SESSION['gd_user'])):
+        if(empty($_SESSION[APP_NAME . 'gd_user'])):
             throw new Exception("No user ID found in session.");
         endif;
         
         return $_SESSION['gd_user']['id'];
     }
-    
+    /*
     private function setTokens($token) {
-        $_SESSION['gd_tokens'] = $token;
+        if(empty($_SESSION['gd_user'])):
+            $_SESSION['gd_user'] = array();
+        endif;
+        $_SESSION['gd_user']['gd_tokens'] = json_decode($token, true);
+        // $_SESSION['gd_tokens'] = $token;
     }
-    
+    */
     public function cleanUser() {
-        unset($_SESSION['gd_user']);
-        unset($_SESSION['gd_tokens']);
+        unset($_SESSION[APP_NAME . 'gd_user']);
+        unset($_SESSION[APP_NAME . 'gd_tokens']);
     }
     
     public function getTokens() {
+        $user = $this->getUser();
+        if(!empty($user['gd_tokens'])):
+            return json_encode($user['gd_tokens']);
+        endif;
+        /*
         if(!empty($_SESSION['gd_tokens'])):
             return $_SESSION['gd_tokens'];
+        endif;
+         */
+    }
+    
+    public function getFilePermissions($allow=self::PERMISSION_PRIVATE) {
+        $permission = new Google_Permission();
+        switch($allow):
+            case self::PERMISSION_PRIVATE:
+                $permission->setValue('me');
+                $permission->setType('default');
+                $permission->setRole('owner');
+                break;
+
+            default:
+                $permission->setValue('');
+                $permission->setType('anyone');
+                $permission->setRole('reader');
+                break;
+        endswitch;
+        return $permission;
+    }
+    
+    public function uploadFile($path, $title, $parentId=null, $allow=self::PERMISSION_PRIVATE) {
+        /** @TODO Build in re-try parameters **/
+        $newFile = new Google_DriveFile();
+        if ($parentId != null) {
+           $parent = new Google_ParentReference();
+           $parent->setId($parentId);
+           $newFile->setParents(array($parent));
+        }
+        $newFile->setTitle($title);
+        $newFile->setDescription("Slide thumbnail created for a SlidesOnGlass Presentation");
+        $newFile->setMimeType(mime_content_type($path));
+        
+        $permission = $this->getFilePermissions($allow);
+        $remoteNewFile = $this->service->files->insert($newFile, array(
+            'data'=>file_get_contents($path),
+            'mimeType'=>  mime_content_type($path)
+        ));
+        $fileId = $remoteNewFile->getId();
+        if(!empty($fileId)):
+            $this->service->permissions->insert($fileId, $permission);
+            return $remoteNewFile;
         endif;
     }
     
@@ -195,21 +259,7 @@ class GoogleDriveComponent extends Component {
                 $copiedFile->setParents(array($parent));
              }
             $newFile = $this->service->files->copy($originFileId, $copiedFile);
-            
-            $permission = new Google_Permission();
-            switch($allow):
-                case self::PERMISSION_PRIVATE:
-                    $permission->setValue('me');
-                    $permission->setType('default');
-                    $permission->setRole('owner');
-                    break;
-
-                default:
-                    $permission->setValue('');
-                    $permission->setType('anyone');
-                    $permission->setRole('reader');
-                    break;
-            endswitch;
+            $permission = $this->getFilePermissions($allow);
             $this->service->permissions->insert($newFile->getId(), $permission);
             
             return $newFile;
@@ -394,8 +444,8 @@ class GoogleDriveComponent extends Component {
             return array('success'=>false, 'message'=>$ex->getMessage());
         }
     }
-    
-    /** SlidesOnGlass Methods **/
+
+    /*
     function getSystemDirectory(\Controller $controller) {
         // find Google Drive system directory
         // define SYSDIR_INDEX (index in Openid META parameter) and FOLDER_SYS constants in application
@@ -444,5 +494,6 @@ class GoogleDriveComponent extends Component {
         
         return $sysdir_info;
     }
+     */
     
 }
